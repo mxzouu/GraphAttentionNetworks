@@ -4,13 +4,20 @@ src/data.py
 
 Chargement des datasets Cora et Citeseer.
 
-On utilise `torch_geometric.datasets.Planetoid` UNIQUEMENT pour télécharger les données
-et accéder au split standard du papier (Yang et al., 2016 ; même split que Kipf & Welling 2017).
+On utilise `torch_geometric.datasets.Planetoid` UNIQUEMENT pour télécharger les
+données et accéder au split standard du papier (Yang et al., 2016 ; même split
+que Kipf & Welling 2017).
 
-Les données sont ensuite converties dans le format simple attendu par notre modèle :
-    - x   : (N, F) features des nœuds
-    - y   : (N,)   labels
-    - adj : (N, N) matrice d'adjacence dense, AVEC SELF-LOOPS
+IMPORTANT : on applique une normalisation par ligne des features.
+Les features Planetoid sont des bag-of-words bruts. Toutes les implémentations
+de référence (GCN, GAT, PyG, DGL) divisent chaque vecteur de features par la
+somme de ses entrées, pour que chaque nœud ait des features sommant à 1.
+Sans cette étape, les nœuds avec beaucoup de mots dominent l'apprentissage.
+
+Format de sortie :
+    - x          : (N, F) features des nœuds, NORMALISÉES par ligne
+    - y          : (N,)   labels
+    - adj        : (N, N) matrice d'adjacence dense, AVEC SELF-LOOPS
     - train_mask, val_mask, test_mask : masques booléens (N,)
 """
 
@@ -21,7 +28,6 @@ import torch
 from torch_geometric.datasets import Planetoid
 
 
-# Chemin où les datasets seront téléchargés/cachés
 DATA_ROOT = Path(__file__).resolve().parent.parent / "data"
 
 
@@ -38,7 +44,6 @@ class GraphData:
     num_classes: int
 
     def to(self, device: torch.device) -> "GraphData":
-        """Déplace tous les tenseurs sur le device demandé."""
         return GraphData(
             x=self.x.to(device),
             y=self.y.to(device),
@@ -51,37 +56,38 @@ class GraphData:
         )
 
 
+def _normalize_features_rowwise(x: torch.Tensor) -> torch.Tensor:
+    """
+    Normalise chaque vecteur de features pour qu'il somme à 1.
+    Évite la division par zéro pour les nœuds sans aucune feature non-nulle.
+    """
+    row_sum = x.sum(dim=1, keepdim=True)                     # (N, 1)
+    row_sum = torch.where(row_sum > 0, row_sum, torch.ones_like(row_sum))
+    return x / row_sum
+
+
 def _edge_index_to_dense_adj(edge_index: torch.Tensor, num_nodes: int) -> torch.Tensor:
     """Convertit un edge_index (2, E) en matrice d'adjacence dense (N, N) avec self-loops."""
     adj = torch.zeros((num_nodes, num_nodes), dtype=torch.float32)
-    # edge_index est de shape (2, E) : [src; dst]
     adj[edge_index[0], edge_index[1]] = 1.0
-    # Self-loops (un nœud doit pouvoir s'attendre à lui-même).
     adj.fill_diagonal_(1.0)
     return adj
 
 
 def load_dataset(name: str) -> GraphData:
-    """
-    Charge un dataset Planetoid au format GraphData.
-
-    Args:
-        name: 'Cora' ou 'Citeseer' (ou 'Pubmed', non testé ici).
-
-    Returns:
-        GraphData prêt à l'emploi.
-    """
+    """Charge un dataset Planetoid au format GraphData."""
     name = name.capitalize()
     if name not in {"Cora", "Citeseer", "Pubmed"}:
         raise ValueError(f"Dataset inconnu : {name}")
 
     dataset = Planetoid(root=str(DATA_ROOT / name), name=name)
-    data = dataset[0]      # un seul graphe
+    data = dataset[0]
 
+    x = _normalize_features_rowwise(data.x.float())
     adj = _edge_index_to_dense_adj(data.edge_index, num_nodes=data.num_nodes)
 
     return GraphData(
-        x=data.x.float(),
+        x=x,
         y=data.y.long(),
         adj=adj,
         train_mask=data.train_mask.bool(),
@@ -93,7 +99,6 @@ def load_dataset(name: str) -> GraphData:
 
 
 if __name__ == "__main__":
-    # Petit sanity-check exécutable via : python -m src.data
     for name in ["Cora", "Citeseer"]:
         d = load_dataset(name)
         print(f"\n=== {name} ===")
@@ -101,5 +106,6 @@ if __name__ == "__main__":
         print(f"  F = {d.num_features} features par nœud")
         print(f"  C = {d.num_classes} classes")
         print(f"  |E| (avec self-loops) = {int(d.adj.sum().item())}")
+        print(f"  Vérification : x[0].sum() = {d.x[0].sum().item():.4f} (devrait être ~1.0)")
         print(f"  train / val / test = "
               f"{int(d.train_mask.sum())} / {int(d.val_mask.sum())} / {int(d.test_mask.sum())}")
