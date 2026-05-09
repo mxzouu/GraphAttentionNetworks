@@ -2,19 +2,14 @@
 src/train.py
 ============
 
-Boucle d'entraînement pour le modèle GAT.
+Boucle d'entraînement pour le modèle GAT (variant='gat' ou 'gatv2').
 
-Suit le protocole du papier (Section 3.3) :
-- Optimiseur : Adam (lr = 0.005 pour Cora/Citeseer ; 0.01 pour Pubmed)
-- L2 weight decay : 5e-4 (Cora/Citeseer) ou 1e-3 (Pubmed)
-- Early stopping : patience de 100 époques sur la val accuracy
+Suit le protocole du papier 2018 (Section 3.3) :
+- Optimiseur : Adam (lr = 0.005 pour Cora/Citeseer)
+- L2 weight decay : 5e-4
 - Loss : NLLLoss (le modèle renvoie déjà du log_softmax)
-
-La fonction principale `train_one_run` :
-    1. construit le modèle
-    2. entraîne avec early stopping
-    3. recharge les meilleurs poids
-    4. retourne (test_acc, val_acc, best_epoch)
+- Early stopping sur la val accuracy (patience = 100)
+- max_epochs : 300 par défaut (cap pour éviter les entraînements trop longs sur CPU)
 """
 
 from copy import deepcopy
@@ -40,20 +35,18 @@ class TrainConfig:
 
     learning_rate: float = 0.005
     weight_decay: float = 5e-4
-    max_epochs: int = 1000
+    max_epochs: int = 300
     patience: int = 100
+
+    variant: str = 'gat'         # 'gat' (papier 2018) ou 'gatv2' (papier 2022)
 
 
 def train_one_run(data: GraphData, config: TrainConfig,
                   device: torch.device,
                   verbose: bool = False) -> tuple[float, float, int]:
     """
-    Effectue un entraînement complet de GAT avec early stopping.
-
-    Returns:
-        test_acc:  accuracy sur l'ensemble de test (avec les meilleurs poids).
-        best_val_acc: meilleure val accuracy atteinte.
-        best_epoch:   époque correspondante.
+    Effectue un entraînement complet avec early stopping et retourne :
+        (test_acc, best_val_acc, best_epoch)
     """
     data = data.to(device)
 
@@ -65,6 +58,7 @@ def train_one_run(data: GraphData, config: TrainConfig,
         num_out_heads=config.num_out_heads,
         dropout=config.dropout,
         alpha=config.alpha,
+        variant=config.variant,
     ).to(device)
 
     optimizer = torch.optim.Adam(
@@ -128,11 +122,7 @@ def train_one_run(data: GraphData, config: TrainConfig,
 def run_experiment(data: GraphData, config: TrainConfig,
                    num_runs: int = 5, device: torch.device | None = None,
                    seed_base: int = 0, verbose: bool = False) -> list[float]:
-    """
-    Lance `num_runs` entraînements indépendants et retourne la liste des test accuracies.
-
-    Chaque run utilise une seed différente (seed_base, seed_base+1, ...).
-    """
+    """Lance `num_runs` entraînements et retourne la liste des test accuracies."""
     from src.utils import set_seed
 
     if device is None:

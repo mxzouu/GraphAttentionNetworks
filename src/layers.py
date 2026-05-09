@@ -2,16 +2,26 @@
 src/layers.py
 =============
 
-Implémentation de la couche Graph Attention (GAT) à partir du papier
-« Graph Attention Networks » (Veličković et al., ICLR 2018).
+Implémentations des couches d'attention :
+  - GATLayer    : attention statique de Veličković et al. (ICLR 2018)
+  - GATv2Layer  : attention dynamique de Brody et al. (ICLR 2022)
+  - MultiHeadGATLayer : wrapper multi-têtes paramétrable (variant='gat' ou 'gatv2')
 
-On implémente :
-- `GATLayer`        : une seule tête d'attention (équations 1, 2, 3, 4 du papier)
-- `MultiHeadGATLayer` : plusieurs têtes en parallèle, fusionnées par
-                        concaténation (couches cachées) ou moyenne (couche de sortie)
+DIFFÉRENCE FONDAMENTALE entre les deux variantes :
 
-Les noms de variables suivent volontairement la notation du papier
-pour faciliter la lecture croisée avec celui-ci.
+  GAT   :  e_ij = LeakyReLU( a^T · [W h_i || W h_j] )
+              ↑ a appliqué APRÈS la concaténation
+              ↑ W et a sont consécutifs ⇒ peuvent fusionner ⇒ attention « statique »
+              ↑ tous les nœuds partagent le même classement de leurs voisins
+
+  GATv2 :  e_ij = a^T · LeakyReLU( W · [h_i || h_j] )
+              ↑ a appliqué APRÈS le LeakyReLU
+              ↑ MLP à 1 couche cachée ⇒ universal approximator ⇒ attention « dynamique »
+              ↑ chaque nœud peut avoir un classement différent de ses voisins
+
+Comme prouvé dans Brody et al. 2022 (Théorème 1), GAT ne peut PAS exprimer une attention
+qui dépend vraiment de la paire (i, j). GATv2 corrige ça en changeant simplement
+l'ordre des opérations : un seul changement de code, gros changement d'expressivité.
 """
 
 import torch
@@ -19,134 +29,164 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+#  GAT (Veličković et al., 2018)
+# ─────────────────────────────────────────────────────────────────────────────
+
 class GATLayer(nn.Module):
     """
-    Une seule tête d'attention GAT.
+    Une seule tête d'attention GAT (équations 1-4 du papier 2018).
 
-    Étant donné des features de nœuds H ∈ R^{N×F} et une matrice d'adjacence A ∈ {0,1}^{N×N},
-    cette couche calcule de nouvelles features H' ∈ R^{N×F'} de la manière suivante :
-
-        1. z_i = W h_i                               (transformation linéaire partagée)
-        2. e_ij = LeakyReLU( a^T [z_i || z_j] )      (score d'attention non normalisé)
-        3. α_ij = softmax_j(e_ij) sur les voisins   (normalisation, masquée par A)
-        4. h'_i = σ( Σ_j α_ij · z_j )                (agrégation pondérée)
-
-    Pour intégrer la structure du graphe, on remplace les e_ij par -∞ pour les paires (i,j)
-    non connectées, ce qui les annule après la softmax (« masked attention »).
+        1. z_i  = W h_i
+        2. e_ij = LeakyReLU( a^T [z_i || z_j] )
+        3. α_ij = softmax_j(e_ij)  sur les voisins (masquée par adj)
+        4. h'_i = σ( Σ_j α_ij · z_j )
     """
 
     def __init__(self, in_features: int, out_features: int,
                  dropout: float = 0.6, alpha: float = 0.2,
                  concat: bool = True):
-        """
-        Args:
-            in_features: F, dimension des features d'entrée.
-            out_features: F', dimension des features de sortie.
-            dropout: probabilité de dropout (appliqué sur les features ET sur les α).
-            alpha: pente négative du LeakyReLU (0.2 dans le papier).
-            concat: si True, applique ELU à la sortie (cas couche cachée).
-                    Si False, pas d'activation (cas couche finale, où on appliquera
-                    la softmax au niveau du modèle complet).
-        """
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
         self.dropout = dropout
-        self.alpha = alpha
         self.concat = concat
 
-        # W ∈ R^{F' × F} : transformation linéaire partagée appliquée à chaque nœud.
-        # On l'implémente comme un Linear sans biais pour coller au papier.
+        # W ∈ R^{F' × F}  — transformation linéaire partagée
         self.W = nn.Linear(in_features, out_features, bias=False)
 
-        # a ∈ R^{2F'} : vecteur d'attention.
-        # Pour des raisons d'efficacité on le coupe en deux moitiés a_src et a_dst,
-        # ce qui permet d'écrire e_ij = a_src · z_i + a_dst · z_j (sans concaténation explicite).
+        # a ∈ R^{2F'} décomposé en deux moitiés pour éviter une concaténation explicite :
+        #   e_ij = a^T [z_i || z_j] = a_src · z_i + a_dst · z_j
         self.a_src = nn.Parameter(torch.empty(out_features, 1))
         self.a_dst = nn.Parameter(torch.empty(out_features, 1))
 
-        self.leakyrelu = nn.LeakyReLU(self.alpha)
+        self.leakyrelu = nn.LeakyReLU(alpha)
         self._reset_parameters()
 
     def _reset_parameters(self):
-        """Initialisation Glorot (Xavier), comme dans le papier."""
         nn.init.xavier_uniform_(self.W.weight)
         nn.init.xavier_uniform_(self.a_src)
         nn.init.xavier_uniform_(self.a_dst)
 
     def forward(self, h: torch.Tensor, adj: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            h:   tenseur (N, F) — features des nœuds.
-            adj: tenseur (N, N) — matrice d'adjacence binaire (avec self-loops déjà ajoutées).
+        z = self.W(h)                                        # (N, F')
 
-        Returns:
-            h':  tenseur (N, F') — nouvelles features.
-        """
-        # Étape 1 : transformation linéaire — z_i = W h_i pour tout i. Shape : (N, F').
-        z = self.W(h)
-        N = z.size(0)
+        attn_src = (z @ self.a_src).squeeze(-1)              # (N,)
+        attn_dst = (z @ self.a_dst).squeeze(-1)              # (N,)
+        e = self.leakyrelu(attn_src.unsqueeze(1) + attn_dst.unsqueeze(0))   # (N, N)
 
-        # Étape 2 : scores d'attention bruts e_ij = LeakyReLU(a^T [z_i || z_j]).
-        # Astuce d'efficacité : a^T [z_i || z_j] = a_src · z_i + a_dst · z_j.
-        # On calcule donc deux vecteurs (N,) puis on les broadcaste pour obtenir (N, N).
-        attn_src = (z @ self.a_src).squeeze(-1)        # shape (N,) : a_src · z_i
-        attn_dst = (z @ self.a_dst).squeeze(-1)        # shape (N,) : a_dst · z_j
-
-        # broadcast : e[i, j] = attn_src[i] + attn_dst[j]
-        e = attn_src.unsqueeze(1) + attn_dst.unsqueeze(0)   # shape (N, N)
-        e = self.leakyrelu(e)
-
-        # Étape 3 : masquage — les paires non connectées reçoivent -∞.
-        # Après softmax elles seront strictement à 0.
-        mask = (adj > 0)
-        e = e.masked_fill(~mask, float('-inf'))
-
-        # softmax sur les voisins (c'est-à-dire sur l'axe j)
-        alpha = F.softmax(e, dim=1)                         # shape (N, N)
-
-        # Dropout sur les coefficients d'attention. Important : c'est explicitement
-        # mentionné dans le papier (Section 3.3) — chaque itération voit donc un
-        # voisinage stochastiquement échantillonné.
+        e = e.masked_fill(adj <= 0, float('-inf'))
+        alpha = F.softmax(e, dim=1)
         alpha = F.dropout(alpha, self.dropout, training=self.training)
 
-        # Étape 4 : agrégation pondérée — h'_i = Σ_j α_ij · z_j.
-        # En forme matricielle : H' = α · Z.
-        h_prime = alpha @ z                                  # shape (N, F')
-
-        if self.concat:
-            return F.elu(h_prime)
-        return h_prime
+        h_prime = alpha @ z                                  # (N, F')
+        return F.elu(h_prime) if self.concat else h_prime
 
 
-class MultiHeadGATLayer(nn.Module):
+# ─────────────────────────────────────────────────────────────────────────────
+#  GATv2 (Brody et al., 2022)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class GATv2Layer(nn.Module):
     """
-    Empile K têtes d'attention GAT indépendantes (équations 5 et 6 du papier).
+    Une seule tête d'attention GATv2 (équation 7 du papier 2022).
 
-    Mode `concat=True` (couches cachées) :
-        h'_i = ‖_{k=1..K}  σ( Σ_j α_ij^k · W^k · h_j )
-        → la sortie a K * out_features features par nœud.
+        1. z_self_i     = W_self · h_i
+           z_neighbor_j = W_neighbor · h_j
+        2. pre_ij = LeakyReLU( z_self_i + z_neighbor_j )    # MLP à 1 couche cachée
+        3. e_ij   = a^T · pre_ij                            # le « a » est appliqué APRÈS
+        4. α_ij   = softmax_j(e_ij)                         # masquée par adj
+        5. h'_i   = σ( Σ_j α_ij · z_neighbor_j )
 
-    Mode `concat=False` (couche finale) :
-        h'_i = (1/K) · Σ_k Σ_j α_ij^k · W^k · h_j
-        → la sortie a out_features features par nœud,
-          et l'activation finale (softmax) est appliquée plus loin par le modèle.
+    L'aggrégation utilise z_neighbor comme « valeur » (équation 4 du papier 2022,
+    inchangée vs GAT) — c'est la convention la plus naturelle qui réutilise la
+    même matrice qui agit sur h_j dans le calcul du score.
     """
 
     def __init__(self, in_features: int, out_features: int,
-                 num_heads: int, dropout: float = 0.6, alpha: float = 0.2,
+                 dropout: float = 0.6, alpha: float = 0.2,
                  concat: bool = True):
         super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.dropout = dropout
+        self.concat = concat
+
+        # W = [W_self | W_neighbor] ∈ R^{F' × 2F}, séparée en deux pour l'efficacité :
+        #   W · [h_i || h_j] = W_self · h_i + W_neighbor · h_j
+        self.W_self = nn.Linear(in_features, out_features, bias=False)
+        self.W_neighbor = nn.Linear(in_features, out_features, bias=False)
+
+        # a ∈ R^{F'} — appliqué APRÈS le LeakyReLU. C'est LE changement clé vs GAT.
+        self.a = nn.Parameter(torch.empty(out_features, 1))
+
+        self.leakyrelu = nn.LeakyReLU(alpha)
+        self._reset_parameters()
+
+    def _reset_parameters(self):
+        nn.init.xavier_uniform_(self.W_self.weight)
+        nn.init.xavier_uniform_(self.W_neighbor.weight)
+        nn.init.xavier_uniform_(self.a)
+
+    def forward(self, h: torch.Tensor, adj: torch.Tensor) -> torch.Tensor:
+        z_self = self.W_self(h)                              # (N, F')
+        z_neighbor = self.W_neighbor(h)                      # (N, F')
+
+        # Pré-activation : pre[i, j, :] = z_self[i] + z_neighbor[j], shape (N, N, F')
+        pre = z_self.unsqueeze(1) + z_neighbor.unsqueeze(0)
+        pre = self.leakyrelu(pre)
+
+        # Score : e[i, j] = a^T · pre[i, j, :]
+        # (N, N, F') @ (F', 1) → (N, N, 1) → squeeze → (N, N)
+        e = (pre @ self.a).squeeze(-1)
+
+        e = e.masked_fill(adj <= 0, float('-inf'))
+        alpha = F.softmax(e, dim=1)
+        alpha = F.dropout(alpha, self.dropout, training=self.training)
+
+        # Aggrégation : on utilise z_neighbor comme valeur (W·h_j de l'équation 4)
+        h_prime = alpha @ z_neighbor                         # (N, F')
+        return F.elu(h_prime) if self.concat else h_prime
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Wrapper multi-têtes (paramétrable GAT / GATv2)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class MultiHeadGATLayer(nn.Module):
+    """
+    Empile K têtes d'attention indépendantes (équations 5-6 du papier 2018).
+
+    Mode `concat=True` (couches cachées) :
+        h'_i = ‖_{k=1..K}  σ( Σ_j α_ij^k · W^k · h_j )
+        → sortie (N, K * F').
+
+    Mode `concat=False` (couche finale) :
+        h'_i = (1/K) · Σ_k Σ_j α_ij^k · W^k · h_j
+        → sortie (N, F').
+
+    Le paramètre `variant` choisit la couche d'attention :
+        - 'gat'   → GATLayer   (papier 2018)
+        - 'gatv2' → GATv2Layer (papier 2022)
+    """
+
+    _VARIANTS = {'gat': GATLayer, 'gatv2': GATv2Layer}
+
+    def __init__(self, in_features: int, out_features: int,
+                 num_heads: int, dropout: float = 0.6, alpha: float = 0.2,
+                 concat: bool = True, variant: str = 'gat'):
+        super().__init__()
+        if variant not in self._VARIANTS:
+            raise ValueError(f"variant doit être dans {list(self._VARIANTS)}, reçu {variant!r}")
+        self.variant = variant
         self.concat = concat
         self.num_heads = num_heads
 
-        # Une GATLayer par tête. Chaque tête a ses propres W et a.
-        # Le `concat` interne contrôle juste si on applique ELU ; ici, dans tous les cas,
-        # on diffère l'activation à la sortie de la couche multi-head.
+        layer_cls = self._VARIANTS[variant]
         self.heads = nn.ModuleList([
-            GATLayer(in_features, out_features,
-                     dropout=dropout, alpha=alpha,
-                     concat=False)            # on ne veut PAS d'ELU à l'intérieur
+            layer_cls(in_features, out_features,
+                      dropout=dropout, alpha=alpha,
+                      concat=False)            # ELU appliquée par le wrapper, pas par les têtes
             for _ in range(num_heads)
         ])
 
@@ -154,9 +194,7 @@ class MultiHeadGATLayer(nn.Module):
         head_outputs = [head(h, adj) for head in self.heads]   # liste de K tenseurs (N, F')
 
         if self.concat:
-            # Concaténation : (N, K * F'), puis ELU
-            out = torch.cat(head_outputs, dim=1)
+            out = torch.cat(head_outputs, dim=1)               # (N, K * F')
             return F.elu(out)
         else:
-            # Moyenne : (N, F'), pas d'activation (softmax appliquée par le modèle)
-            return torch.mean(torch.stack(head_outputs, dim=0), dim=0)
+            return torch.mean(torch.stack(head_outputs, dim=0), dim=0)   # (N, F')
