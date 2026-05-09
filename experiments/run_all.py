@@ -2,17 +2,20 @@
 experiments/run_all.py
 ======================
 
-Lance Cora et Citeseer pour les deux variantes (GAT et GATv2), puis affiche
-trois tableaux récapitulatifs :
+Lance Cora et Citeseer pour les deux variantes (GAT et GATv2), affiche les
+trois tableaux récapitulatifs, et SAUVEGARDE tous les résultats sous un format
+structuré pour qu'un notebook d'analyse puisse les charger sans avoir à
+réentraîner les modèles.
 
-    1. GAT   : notre implémentation vs papier 2018 (Veličković et al.)
-    2. GATv2 : notre implémentation vs papier 2022 (Brody et al.)
-    3. GAT vs GATv2 : comparaison directe de NOS résultats
+Fichiers produits dans `results/` :
+    - summary.txt    : tableau récapitulatif lisible
+    - runs.json      : structure complète (5 runs × 4 configs) pour le notebook
 
 Usage :
     python -m experiments.run_all
 """
 
+import json
 from pathlib import Path
 
 import numpy as np
@@ -37,7 +40,7 @@ def main():
     cora_results = run_cora()
     citeseer_results = run_citeseer()
 
-    # Préparation des chiffres
+    # ─── Préparation des chiffres pour l'affichage ──────────────────────────
     cora_gat = cora_results['gat']['mean_std']
     cora_gatv2 = cora_results['gatv2']['mean_std']
     cite_gat = citeseer_results['gat']['mean_std']
@@ -46,16 +49,13 @@ def main():
     cora_delta = _delta(cora_results['gatv2']['accs'], cora_results['gat']['accs'])
     cite_delta = _delta(citeseer_results['gatv2']['accs'], citeseer_results['gat']['accs'])
 
-    # ─────────────────────────────────────────────────────────────────
-    #  Construction des trois tableaux
-    # ─────────────────────────────────────────────────────────────────
+    # ─── Construction des trois tableaux ────────────────────────────────────
     lines = []
     lines.append("")
     lines.append("=" * 78)
     lines.append("  RÉCAPITULATIF FINAL")
     lines.append("=" * 78)
 
-    # Tableau 1 : GAT
     lines.append("")
     lines.append("  ┌───────────────────────────────────────────────────────────────────────┐")
     lines.append("  │  TABLEAU 1 — GAT (Veličković et al., ICLR 2018)                       │")
@@ -65,7 +65,6 @@ def main():
     lines.append(f"    {'Cora':<12} | {cora_gat + ' %':<24} | {'83.0 ± 0.7 %':<20}")
     lines.append(f"    {'Citeseer':<12} | {cite_gat + ' %':<24} | {'72.5 ± 0.7 %':<20}")
 
-    # Tableau 2 : GATv2
     lines.append("")
     lines.append("  ┌───────────────────────────────────────────────────────────────────────┐")
     lines.append("  │  TABLEAU 2 — GATv2 (Brody et al., ICLR 2022)                          │")
@@ -80,7 +79,6 @@ def main():
     lines.append("      papier rapporte GAT 78.1% vs GATv2 78.5% (différence faible mais")
     lines.append("      significative). Voir Annexe D.3 du papier 2022.")
 
-    # Tableau 3 : comparaison directe GAT vs GATv2 (nos résultats)
     lines.append("")
     lines.append("  ┌───────────────────────────────────────────────────────────────────────┐")
     lines.append("  │  TABLEAU 3 — Comparaison directe GAT vs GATv2 (NOTRE implémentation)  │")
@@ -96,18 +94,54 @@ def main():
     summary = "\n".join(lines)
     print(summary)
 
-    # ─────────────────────────────────────────────────────────────────
-    #  Sauvegarde dans results/summary.txt
-    # ─────────────────────────────────────────────────────────────────
-    output_file = RESULTS_DIR / "summary.txt"
-    with output_file.open("w", encoding="utf-8") as f:
+    # ─── Sauvegarde texte (lisible) ─────────────────────────────────────────
+    summary_file = RESULTS_DIR / "summary.txt"
+    with summary_file.open("w", encoding="utf-8") as f:
         f.write(summary + "\n\n")
         f.write("Détail des runs :\n")
         f.write(f"  Cora     GAT   : {[f'{a*100:.2f}%' for a in cora_results['gat']['accs']]}\n")
         f.write(f"  Cora     GATv2 : {[f'{a*100:.2f}%' for a in cora_results['gatv2']['accs']]}\n")
         f.write(f"  Citeseer GAT   : {[f'{a*100:.2f}%' for a in citeseer_results['gat']['accs']]}\n")
         f.write(f"  Citeseer GATv2 : {[f'{a*100:.2f}%' for a in citeseer_results['gatv2']['accs']]}\n")
-    print(f"\n  → Résumé sauvegardé dans : {output_file}")
+    print(f"\n  → Résumé sauvegardé dans : {summary_file}")
+
+    # ─── Sauvegarde structurée (JSON, pour le notebook) ─────────────────────
+    structured = {
+        "Cora": {
+            "gat": {
+                "accs": [float(a) for a in cora_results['gat']['accs']],
+                "mean_pct": float(np.mean(cora_results['gat']['accs']) * 100),
+                "std_pct": float(np.std(cora_results['gat']['accs']) * 100),
+            },
+            "gatv2": {
+                "accs": [float(a) for a in cora_results['gatv2']['accs']],
+                "mean_pct": float(np.mean(cora_results['gatv2']['accs']) * 100),
+                "std_pct": float(np.std(cora_results['gatv2']['accs']) * 100),
+            },
+        },
+        "Citeseer": {
+            "gat": {
+                "accs": [float(a) for a in citeseer_results['gat']['accs']],
+                "mean_pct": float(np.mean(citeseer_results['gat']['accs']) * 100),
+                "std_pct": float(np.std(citeseer_results['gat']['accs']) * 100),
+            },
+            "gatv2": {
+                "accs": [float(a) for a in citeseer_results['gatv2']['accs']],
+                "mean_pct": float(np.mean(citeseer_results['gatv2']['accs']) * 100),
+                "std_pct": float(np.std(citeseer_results['gatv2']['accs']) * 100),
+            },
+        },
+        "paper_baselines": {
+            "Cora": {"gat_mean": 83.0, "gat_std": 0.7},
+            "Citeseer": {"gat_mean": 72.5, "gat_std": 0.7},
+        },
+    }
+
+    json_file = RESULTS_DIR / "runs.json"
+    with json_file.open("w", encoding="utf-8") as f:
+        json.dump(structured, f, indent=2, ensure_ascii=False)
+    print(f"  → Données structurées sauvegardées dans : {json_file}")
+    print(f"     (utilisées par le notebook d'analyse)")
 
 
 if __name__ == "__main__":
